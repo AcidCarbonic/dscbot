@@ -1,64 +1,66 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 import yt_dlp
 import asyncio
 import datetime
+import glob
 import os
 import time
 import random
 
-# --- TẠO THƯ MỤC CACHE ---
 CACHE_DIR = "music_cache"
 if not os.path.exists(CACHE_DIR):
     os.makedirs(CACHE_DIR)
 
-# --- BIẾN TOÀN CỤC ---
 queues = {}          
 current_song = {}    
 loop_status = {}     
 start_times = {}
+
 ytdl_format_options = {
     'format': 'bestaudio/best',
     'outtmpl': f'{CACHE_DIR}/%(id)s.%(ext)s',
     'restrictfilenames': True,
     'noplaylist': True,
     'nocheckcertificate': True,
-    'ignoreerrors': False,
+    'ignoreerrors': True, # Bỏ qua lỗi nhỏ để tránh treo bot
     'logtostderr': False,
     'quiet': True,
     'no_warnings': True,
     'default_search': 'auto',
-    'source_address': '0.0.0.0',
-    'postprocessors': [{
-        'key': 'FFmpegExtractAudio',
-        'preferredcodec': 'mp3',
-        'preferredquality': '192',
-    }]
+    'source_address': '0.0.0.0'
 }
 
+# Tối ưu FFmpeg để tránh bị ngắt quãng nửa chừng
 ffmpeg_options = {
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
     'options': '-vn'
 }
 
-# --- HÀM HỖ TRỢ ---
 def format_duration(seconds):
-    if not seconds: return "Unknown"
-    return str(datetime.timedelta(seconds=seconds))
+    if not seconds: return "0:00"
+    return str(datetime.timedelta(seconds=int(seconds)))
+
+def find_in_cache(video_id):
+    files = glob.glob(os.path.join(CACHE_DIR, f"{video_id}.*"))
+    return files[0] if files else None
 
 async def get_video_info(search_query):
     loop = asyncio.get_event_loop()
-    # Chỉnh noplaylist=False để lấy được cả danh sách phát
+    # Chỉ lấy info nhanh, chưa tải
     opts = {'format': 'bestaudio/best', 'default_search': 'auto', 'noplaylist': False, 'quiet': True}
     
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info = await loop.run_in_executor(None, lambda: ydl.extract_info(search_query, download=False))
+        try:
+            info = await loop.run_in_executor(None, lambda: ydl.extract_info(search_query, download=False))
+        except Exception:
+            return "ERROR"
         
-        # Trường hợp là Playlist
         if 'entries' in info:
             songs = []
             for entry in info['entries']:
-                if entry and entry.get('duration', 0) <= 420: # Chỉ lấy bài dưới 7p
+                if entry and entry.get('duration', 0) <= 600:
                     songs.append({
                         'id': entry['id'],
                         'title': entry['title'],
@@ -68,16 +70,16 @@ async def get_video_info(search_query):
                     })
             return songs if songs else "NO_VALID_SONGS"
 
-        # Trường hợp bài đơn lẻ
-        if info.get('duration', 0) > 420:
+        if info.get('duration', 0) > 600:
             return "TOO_LONG"
             
         video_id = info['id']
-        file_path = f"{CACHE_DIR}/{video_id}.mp3"
+        file_path = find_in_cache(video_id)
         
-        if not os.path.exists(file_path):
+        if not file_path:
             with yt_dlp.YoutubeDL(ytdl_format_options) as ydl_down:
-                await loop.run_in_executor(None, lambda: ydl_down.process_info(info))
+                await loop.run_in_executor(None, lambda: ydl_down.download([info['webpage_url']]))
+                file_path = find_in_cache(video_id)
 
         return {
             'file_path': file_path,
@@ -86,6 +88,7 @@ async def get_video_info(search_query):
             'duration': info.get('duration', 0),
             'uploader': info.get('uploader', 'Unknown')
         }
+
 def create_progress_bar(guild_id, total_duration):
     if guild_id not in start_times or total_duration == 0:
         return "▬" * 15
@@ -95,51 +98,41 @@ def create_progress_bar(guild_id, total_duration):
     size = 15
     dot_pos = int(progress * size)
     
-    bar = ""
-    for i in range(size):
-        if i == dot_pos: bar += "🔘"
-        else: bar += "▬"
+    bar = "".join(["🔘" if i == dot_pos else "▬" for i in range(size)])
     return f"{bar} ({format_duration(elapsed)}/{format_duration(total_duration)})"
-def play_next(guild_id, voice_client, bot_loop):
-    # 1. Dọn dẹp cache bài cũ
-    if not loop_status.get(guild_id, False) and guild_id in current_song:
-        path = current_song[guild_id].get('file_path')
-        if path and os.path.exists(path):
-            try: os.remove(path)
-            except: pass
 
-    # 2. Lấy bài tiếp theo
+def play_next(guild_id, voice_client, bot, channel): # Sửa bot_loop thành bot, channel
     if loop_status.get(guild_id, False) and guild_id in current_song:
         song = current_song[guild_id]
     elif guild_id in queues and len(queues[guild_id]) > 0:
         song = queues[guild_id].pop(0)
     else:
-        # Hết nhạc: Dọn dẹp
-        for d in [queues, current_song, loop_status, start_times]:
-            if guild_id in d: d.pop(guild_id, None)
+        # Hết nhạc
+        for d in [current_song, loop_status, start_times]:
+            if guild_id in d: d.pop(guild_id)
         if voice_client and voice_client.is_connected():
-            asyncio.run_coroutine_threadsafe(voice_client.disconnect(), bot_loop)
+            asyncio.run_coroutine_threadsafe(voice_client.disconnect(), bot.loop)
         return
 
-    # 3. KIỂM TRA NẾU BÀI HÁT CHƯA TẢI (Dành cho Playlist)
-    if 'file_path' not in song:
-        # Gọi lại get_video_info để tải file
-        async def download_and_play():
-            info = await get_video_info(song['webpage_url'])
-            if isinstance(info, dict):
-                current_song[guild_id] = info
-                start_times[guild_id] = time.time()
-                source = discord.FFmpegPCMAudio(info['file_path'], **ffmpeg_options)
-                voice_client.play(source, after=lambda e: play_next(guild_id, voice_client, bot_loop))
+    async def process_and_play():
+        target_song = song
+        if 'file_path' not in target_song:
+            res = await get_video_info(target_song['webpage_url'])
+            if isinstance(res, dict): target_song = res
+            else: return play_next(guild_id, voice_client, bot, channel)
+
+        current_song[guild_id] = target_song
+        start_times[guild_id] = time.time()
         
-        asyncio.run_coroutine_threadsafe(download_and_play(), bot_loop)
-        return
+        # Gửi tin nhắn Now Playing
+        embed = discord.Embed(title="🎵 Now Playing", description=f"[{target_song['title']}]({target_song['webpage_url']})", color=0xff0000)
+        embed.add_field(name="Tiến độ", value=create_progress_bar(guild_id, target_song['duration']))
+        await channel.send(embed=embed, view=MusicControls(bot))
 
-    # 4. Phát nhạc bình thường
-    current_song[guild_id] = song
-    start_times[guild_id] = time.time()
-    source = discord.FFmpegPCMAudio(song['file_path'], **ffmpeg_options)
-    voice_client.play(source, after=lambda e: play_next(guild_id, voice_client, bot_loop))
+        source = discord.FFmpegPCMAudio(target_song['file_path'], **ffmpeg_options)
+        voice_client.play(source, after=lambda e: play_next(guild_id, voice_client, bot, channel))
+
+    asyncio.run_coroutine_threadsafe(process_and_play(), bot.loop)
 
 def get_queue_embed(guild_id):
     if guild_id not in queues or not queues[guild_id]:
@@ -221,6 +214,7 @@ class MusicControls(discord.ui.View):
 class MusicCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self.clean_cache.start() # Chạy task dọn dẹp
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
@@ -234,50 +228,46 @@ class MusicCog(commands.Cog):
                     # Reset data server đó
                     gid = before.channel.guild.id
                     if gid in queues: del queues[gid]
-
+    @tasks.loop(hours=1)
+    async def clean_cache(self):
+        """Xóa các file cache cũ hơn 3 tiếng để tiết kiệm dung lượng"""
+        now = time.time()
+        for f in os.listdir(CACHE_DIR):
+            f_path = os.path.join(CACHE_DIR, f)
+            # Nếu file cũ hơn 3 tiếng (10800 giây) thì xóa
+            if os.stat(f_path).st_mtime < now - 10800:
+                try:
+                    os.remove(f_path)
+                    print(f"🗑️ Đã xóa cache cũ: {f}")
+                except:
+                    pass
     @app_commands.command(name="play", description="Phát nhạc (Dưới 7p/Playlist)")
     async def play(self, interaction: discord.Interaction, query: str):
         await interaction.response.defer(ephemeral=True)
         
-        # Kiểm tra Voice
         if not interaction.user.voice:
             return await interaction.followup.send("❌ Bạn chưa vào voice!", ephemeral=True)
 
         res = await get_video_info(query)
-
-        # Xử lý lỗi cụ thể
-        if res == "TOO_LONG":
-            return await interaction.followup.send("❌ Bài hát dài quá 7 phút. Vui lòng chọn bài khác.", ephemeral=True)
-        if res == "NO_VALID_SONGS":
-            return await interaction.followup.send("❌ Playlist không có bài nào dưới 7 phút.", ephemeral=True)
+        if res == "TOO_LONG": return await interaction.followup.send("❌ Quá 7 phút.", ephemeral=True)
+        if res == "NO_VALID_SONGS": return await interaction.followup.send("❌ Không có bài hợp lệ.", ephemeral=True)
         
         guild_id = interaction.guild.id
         if guild_id not in queues: queues[guild_id] = []
 
-        # Xử lý nếu res là một danh sách (Playlist)
         if isinstance(res, list):
-            for song in res:
-                queues[guild_id].append(song)
-            await interaction.followup.send(f"✅ Đã thêm playlist với {len(res)} bài vào hàng đợi.", ephemeral=True)
+            queues[guild_id].extend(res)
+            await interaction.followup.send(f"✅ Đã thêm playlist ({len(res)} bài).", ephemeral=True)
         else:
             queues[guild_id].append(res)
             await interaction.followup.send(f"✅ Đã thêm **{res['title']}**", ephemeral=True)
 
-        # Logic khởi chạy voice client (giữ nguyên của bạn)
         vc = interaction.guild.voice_client
         if not vc: vc = await interaction.user.voice.channel.connect()
 
         if not vc.is_playing() and not vc.is_paused():
-            # Nếu bài đầu tiên chưa có file_path (do lấy từ playlist chưa download)
-            # Bạn nên thêm logic download vào đây hoặc trong play_next
-            play_next(guild_id, vc, self.bot.loop)
-            
-            # Gửi khung Now Playing
-            song = current_song.get(guild_id)
-            if song:
-                embed = discord.Embed(title="🎵 Now Playing", description=f"[{song['title']}]({song['webpage_url']})", color=0xff0000)
-                embed.add_field(name="Tiến độ", value=create_progress_bar(guild_id, song['duration']))
-                await interaction.channel.send(embed=embed, view=MusicControls(self.bot))
+            # Chỉ gọi hàm này, không viết thêm logic gửi Embed ở đây nữa
+            play_next(guild_id, vc, self.bot, interaction.channel)
 
     @app_commands.command(name="shuffle", description="Trộn ngẫu nhiên hàng đợi")
     async def shuffle(self, interaction: discord.Interaction):

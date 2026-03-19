@@ -1,6 +1,7 @@
 import discord
 from discord.ext import commands
 import asyncio
+import os
 
 # Cấu hình cơ bản
 intents = discord.Intents.default()
